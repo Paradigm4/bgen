@@ -9,14 +9,6 @@
 #include <chrono>
 #include <thread>
 
-#if defined(__x86_64__)
-  #include <immintrin.h>
-#endif
-
-#if defined(__aarch64__)
-  #include <arm_neon.h>
-#endif
-
 #include "zstd/lib/zstd.h"
 #include <zlib.h>
 
@@ -321,68 +313,6 @@ void Genotypes::probabilities_layout1(char * uncompressed, std::uint32_t idx, fl
 /// fast path for phased data with ploidy=2, and 8 bits per probability
 void Genotypes::fast_haplotype_probs(char * uncompressed, std::uint32_t idx, float * probs,  std::uint32_t & nrows) {
   std::uint32_t n = 0;
-#if defined(__x86_64__)
-  if (__builtin_cpu_supports("avx2")) {
-    const std::uint32_t c = 255;
-    const float f = 1.0 / 255.0f;
-    __m256i k = _mm256_set_epi32(c, c, c, c, c, c, c, c);
-    __m256 j = _mm256_set_ps(f, f, f, f, f, f, f, f);
-    
-    __m128i initial;
-    __m256i widened, partner;
-    __m256 store_lo, store_hi;
-    
-    // run through most of the samples, but make sure we stay well away from the
-    // end of the float array, so the mm_loadu doesn't attempt to load beyond
-    // the end of the array
-    for ( ; n + 32 < nrows * 2; n+=32) {
-      // load 16 values into a m128 register
-      initial = _mm_loadu_si128((const __m128i*) &uncompressed[idx]);
-      
-      // expand the first 8 values to 32-bits, and get the corresponding delta
-      widened = _mm256_cvtepu8_epi32(initial);
-      partner = _mm256_sub_epi32(k, widened);
-      
-      // interleave the registers to get paired values beside each other, then
-      // convert to float and multiply by inverted constant to get probability
-      store_lo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_unpacklo_epi32(widened, partner)), j);
-      store_hi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_unpackhi_epi32(widened, partner)), j);
-      
-      // _mm256_unpacklo_epi32 interleaves values from two registers, but it
-      // does it within the top part of each m128 portion of the register
-      // we start with
-      // widened = [a1, b1, c1, d1, e1, f1, g1, h1]
-      // partner = [a2, b2, c2, d2, e2, f2, g2, h2]  # (1 - widened)
-      
-      // we want to store the sequential partners e.g.
-      // [a1, a2, b1, b2, c1, c2, d1, d1]
-      
-      // but _mm256_unpacklo_epi32 gives registers with mixed order
-      // [a1, a2, b1, b2, e1, e2, f1, f2]
-      // [c1, c2, d1, d2, g1, g2, h1, h2]
-      // this means we need to store the first and last four values in separate
-      // steps to ensure the correct ordering
-      _mm_storeu_ps(&probs[n], _mm256_castps256_ps128(store_lo));
-      _mm_storeu_ps(&probs[n + 4], _mm256_castps256_ps128(store_hi));
-      _mm_storeu_ps(&probs[n + 8], _mm256_extractf128_ps(store_lo, 1));
-      _mm_storeu_ps(&probs[n + 12], _mm256_extractf128_ps(store_hi, 1));
-      
-      // now repeat for the other 8 values of the original register
-      widened = _mm256_cvtepu8_epi32(_mm_bsrli_si128(initial, 8));
-      partner = _mm256_sub_epi32(k, widened);
-      
-      store_lo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_unpacklo_epi32(widened, partner)), j);
-      store_hi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_unpackhi_epi32(widened, partner)), j);
-      
-      _mm_storeu_ps(&probs[n + 16], _mm256_castps256_ps128(store_lo));
-      _mm_storeu_ps(&probs[n + 20], _mm256_castps256_ps128(store_hi));
-      _mm_storeu_ps(&probs[n + 24], _mm256_extractf128_ps(store_lo, 1));
-      _mm_storeu_ps(&probs[n + 28], _mm256_extractf128_ps(store_hi, 1));
-      
-      idx += 16;
-    }
-  }
-#endif
   // finish off the unvectorized samples
   std::uint8_t first;
   for (; n < nrows * 2; n += 2) {
@@ -570,109 +500,6 @@ int Genotypes::find_minor_allele(float * dose) {
 /// @param idx uint position where the genotype probabilties begin
 void Genotypes::ref_dosage_fast(char *uncompressed, std::uint32_t idx, float *dose, std::uint32_t nrows) {
   std::uint32_t n=0;
-#if defined(__x86_64__)
-  if (__builtin_cpu_supports("avx2")) {
-    __m256i mask_odd = _mm256_set_epi8(0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0,
-      -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0,  -1, 0, -1, 0, -1, 0, -1);
-    __m256i mask_even = _mm256_set_epi8(-1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0,
-      -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0);
-    const float c = 1.0f / 255.0f;
-    __m256 k = _mm256_set_ps(c, c, c, c, c, c, c, c);
-    
-    __m256i initial;
-    __m256i first;
-    __m256i second;
-    __m128i lo16;
-    __m256i lo;
-    __m256 lo_float;
-    __m128i hi16;
-    __m256i hi;
-    __m256 hi_float;
-    for (; n + 32 < nrows; n+=16) {
-      initial = _mm256_loadu_si256((__m256i *) &uncompressed[idx]);
-      
-      // get heterozygous int dosage by masking out the even bytes, and right
-      // shifting by one byte, to align homozygous and heterozygous counts. The
-      // shift operation is from https://stackoverflow.com/a/25264853.
-      second = _mm256_and_si256(initial, mask_even);
-      second = _mm256_alignr_epi8(_mm256_permute2x128_si256(second, second, _MM_SHUFFLE(2, 0, 0, 1)), second, 1);
-      
-      // get homozygous int dosage by masking odd bytes, and left shift one bit to
-      // multiply homozygous counts by 2 (since ploidy=2)
-      first = _mm256_and_si256(initial, mask_odd);
-      first = _mm256_slli_epi32(first, 1);
-      
-      // Now we have two 256 bit vectors with dosage counts adjusted for ploidy.
-      // One for homozygous counts and one for heterozygous counts. Counts started
-      // as 8-bit uints, interleaved with empty bytes (hom count spreads into
-      // adjacent byte, as 9-bit uint). We can treat them as 16-bit ints for addition
-      initial = _mm256_add_epi16(first, second);
-      
-      // convert the first half to floats, via 32 bit ints
-      lo16 = _mm256_castsi256_si128(initial);
-      lo = _mm256_cvtepi16_epi32(lo16);
-      lo_float = _mm256_cvtepi32_ps(lo);
-      
-      // convert the second half to floats, via 32 bit ints
-      hi16 = _mm256_extractf128_si256(initial, 1);
-      hi = _mm256_cvtepi16_epi32(hi16);
-      hi_float = _mm256_cvtepi32_ps(hi);
-      
-      _mm256_storeu_ps(&dose[n], _mm256_mul_ps(lo_float, k));
-      _mm256_storeu_ps(&dose[n + 8], _mm256_mul_ps(hi_float, k));
-      
-      idx += 32;
-    }
-  }
-#elif defined(__aarch64__)
-  // using this optimised method roughly doubles the speed of computing the ref
-  // dosage, but it has a limited impact, since 80-90% of the time is spent
-  // decompressing the genotypes array (with zlib compressed data).
-  std::uint8_t * buff = reinterpret_cast<std::uint8_t *>(uncompressed);
-  const float c = 1.0f / 255.0f;
-  float32x4_t k = vdupq_n_f32(c);
-  uint8x16x2_t initial;
-  uint16x8_t het, hom, total;
-  float32x4_t _dose;
-  for (; n + 16 < nrows; n += 8) {
-    // load data from the array into SIMD registers. This deinterleaves the
-    // het and hom counts into separate vector registers
-    initial = vld2q_u8(buff + idx);
-
-    // we need to convert the 8-bit uints to 32 bit floats, but we can't do that
-    // in one operation, since we've already packed the vector register. We start
-    // with the low half of each register, and first expand to 16-bit uints,
-    // since homozyous counts can go over by one bit
-    hom = vmovl_u8(vget_low_u8(initial.val[0]));
-    het = vmovl_u8(vget_low_u8(initial.val[1]));
-    hom = vshlq_n_u16(hom, 1);  // multiply hom alt counts by 2 since ploidy=2
-
-    // sum the heterozygous and homozygous dosages
-    total = vaddq_u16(het, hom);
-
-    // still in low half, now expand 16-bit uints to 32-bit, convert to float, store
-    _dose = vcvtq_f32_u32(vmovl_u16(vget_low_u16(total)));
-    vst1q_f32(dose + n, vmulq_f32(_dose, k));
-    _dose = vcvtq_f32_u32(vmovl_u16(vget_high_u16(total)));
-    vst1q_f32(dose + n + 4, vmulq_f32(_dose, k));
-
-    // repeat for the high half of the vectors
-    hom = vmovl_u8(vget_high_u8(initial.val[0]));
-    het = vmovl_u8(vget_high_u8(initial.val[1]));
-    hom = vshlq_n_u16(hom, 1);
-
-    // sum the heterozygous and homozygous dosages
-    total = vaddq_u16(het, hom);
-
-    // expand each half to 32-bit, convert to float, store
-    _dose = vcvtq_f32_u32(vmovl_u16(vget_low_u16(total)));
-    vst1q_f32(dose + n + 8, vmulq_f32(_dose, k));
-    _dose = vcvtq_f32_u32(vmovl_u16(vget_high_u16(total)));
-    vst1q_f32(dose + n + 12, vmulq_f32(_dose, k));
-
-    idx += 16;
-  }
-#endif
   // Finish off the remaining unvectorized samples. This is 50% slower than SIMD.
   // Also handles if we can't use the code above (not aarch64, x86_64 or lacks avx2)
   for (; n < (nrows - (nrows % 2)); n += 2) {
@@ -746,21 +573,7 @@ void Genotypes::ref_dosage_slow(char * uncompressed, std::uint32_t idx, float * 
 /// x86_64 and aarch64 hardware
 void Genotypes::swap_allele_dosage(float * dose) {
   std::uint32_t n=0;
-#if defined(__x86_64__)
-  __m256 k = {2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f};
-  __m256 batch;
-  for (; n + 8 < n_samples; n+=8) {
-    batch = _mm256_loadu_ps(dose + n);
-    _mm256_storeu_ps(dose + n, _mm256_sub_ps(k, batch));
-  }
-#elif defined(__aarch64__)
-  float32x4_t k = vdupq_n_f32(2.0f);
-  float32x4_t batch;
-  for (; n + 4 < n_samples; n += 4) {
-    batch = vld1q_f32(dose + n);
-    vst1q_f32(dose + n, vsubq_f32(k, batch));
-  }
-#endif
+
   for (; n + 4 < n_samples; n+=4) {
     dose[n] = 2.0f - dose[n];
     dose[n+1] = 2.0f - dose[n+1];
